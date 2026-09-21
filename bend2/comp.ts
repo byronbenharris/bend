@@ -2931,7 +2931,7 @@ export function book_owned(src: Bend.Book, ks = OWNED): void {
   }
 }
 
-function compile_tables(fl: File, entries: Seg[]): string[] {
+function compile_tables(fl: File, entries: Seg[], forky: Set<string>): string[] {
   const defs: string[] = [];
   for (const ms of [[...fl.cids.keys()].map(cid_mac),
     [...entries.map((s) => s.fid), "FID_EXIT", "FID_ENTER"]]) {
@@ -2949,17 +2949,6 @@ function compile_tables(fl: File, entries: Seg[]): string[] {
     defs.push(`CONSTV u8 ${nm}[] = { ${vals.join(", ")} };`);
   };
   table("FID_ARITY_T", entries.map((s) => s.params.length));
-  // A segment may fork (or bang) when it, or one it reaches, does; a
-  // closure apply reaches every closure.
-  const forky = new Set(fl.segs.filter((s) => s.fork).map((s) => s.fid));
-  for (let n = -1; n !== forky.size;) {
-    n = forky.size;
-    for (const s of [...fl.segs, { fid: "FID_CLO_APPLY", refs: fl.clos }]) {
-      if (!forky.has(s.fid) && [...s.refs].some((r) => forky.has(r))) {
-        forky.add(s.fid);
-      }
-    }
-  }
   table("FID_FLAG_T", entries.map((s) => Number(fl.bangs.has(s.def))
     | Number(!forky.has(s.fid)) << 1));
   table("FID_RESW_T", entries.map((s) =>
@@ -3033,24 +3022,47 @@ export function compile_book(book: Bend.Book): string {
     was = facts();
     fl = pass(done_defs(cb).reverse());
   } while (was !== facts());
-  const reach = (from: string[], set = new Set<string>()): Set<string> => {
-    const grab = (fid: string) => set.has(fid) || (set.add(fid)
-      && (fl.segs.find((s) => s.fid === fid)?.refs
-        ?? fl.spins.find((s) => s[0] === fid)?.[2])?.forEach(grab));
-    from.forEach(grab);
-    return set;
+  const refs = new Map(fl.spins.map(([fid, , targets]) =>
+    [fid, targets] as const));
+  for (const seg of fl.segs) {
+    refs.set(seg.fid, seg.refs);
+  }
+  const reach = (from: string[], graph: typeof refs) => {
+    const seen = new Set<string>();
+    for (let i = 0; i < from.length; i++) {
+      const fid = from[i];
+      if (seen.has(fid)) {
+        continue;
+      }
+      seen.add(fid);
+      from.push(...graph.get(fid) ?? []);
+    }
+    return seen;
   };
-  const live = reach([seg_fid("main")]);
+  const live = reach([seg_fid("main")], refs);
   // The device holds what the bangs reach and, when a bang's parameter
   // may hold a closure (a jump through its fid), every closure.
   const wide = [...fl.bangs].some((k) =>
     sig_def(fl, k).live.some(([, , A]) => ty_clo(fl.book, A)));
-  const dev = reach([...[...fl.bangs].map(seg_fid), ...wide ? fl.clos : []]);
+  const dev = reach([...[...fl.bangs].map(seg_fid), ...wide ? fl.clos : []],
+    refs);
   fl.segs = fl.segs.filter((s) => live.has(s.fid));
-  for (const s of fl.segs) {
-    s.host = !dev.has(s.fid);
+  for (const seg of fl.segs) {
+    seg.host = !dev.has(seg.fid);
   }
   fl.spins = fl.spins.filter(([n]) => live.has(n));
+  // A segment may fork when it, or one it reaches, does; closure apply
+  // reaches every closure.
+  const callers = new Map<string, Set<string>>();
+  for (const seg of [...fl.segs, { fid: "FID_CLO_APPLY", refs: fl.clos }]) {
+    for (const target of seg.refs) {
+      const sources = callers.get(target) ?? new Set<string>();
+      sources.add(seg.fid);
+      callers.set(target, sources);
+    }
+  }
+  const forky = reach(fl.segs.filter((s) => s.fork).map((s) => s.fid),
+    callers);
   const entries = [...fl.segs, seg_new("io_emit", BOX, [""]),
     seg_new("clo_apply", BOX, ["", ""])];
   const desc = show === null ? [] : ["#if !DEVICE",
@@ -3058,7 +3070,7 @@ export function compile_book(book: Bend.Book): string {
       typeof c === "string" ? cid_mac(c) : c).join(", ")} };`,
     `static const char* SHOW_NAMES[] = { ${show.names.map((n) =>
       JSON.stringify(n)).join(", ")} };`, "#endif"];
-  const defs = compile_tables(fl, entries);
+  const defs = compile_tables(fl, entries, forky);
   defs.push(`#define MAIN_FID ${seg_fid("main")}`, `#define MAIN_PURE ${
     Number(show !== null)}`,
     `#define BLK_SHR ${Number(cb.hot.has("t:Array"))}`);

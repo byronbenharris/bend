@@ -1554,6 +1554,17 @@ function file_push(fl: File, line: string): void {
   fl.seg.lines.push("  ".repeat(fl.tab) + line);
 }
 
+// Run with selected local fields restored afterward. The objects they point
+// to stay shared: facts, emitted segments and other monotone output survive.
+function file_scope<R>(fl: File, keys: (keyof File)[], go: () => R): R {
+  const old = Object.fromEntries(keys.map((k) => [k, fl[k]]));
+  try {
+    return go();
+  } finally {
+    Object.assign(fl, old);
+  }
+}
+
 // Block
 // =====
 
@@ -1895,7 +1906,11 @@ function val_box(fl: File, v: Val): string {
   const out = emit_hold(fl, ["0"], "b")[0];
   const tag = emit_alias(fl, v.ws[0], "t");
   emit_chain(fl, (i) => `${tag} == ${i}`, arms.map((arm) => () => {
-    file_push(fl, `${out} = ${build(arm)};`);
+    file_scope(fl, ["spares"], () => {
+      fl.spares = [];
+      file_push(fl, `${out} = ${build(arm)};`);
+      spare_flush(fl);
+    });
   }));
   return out;
 }
@@ -2089,15 +2104,14 @@ function emit_args(fl: File, ck: Call, jump = false, fork = false): string[] {
   const vars = xs.filter((x) => x.$ === "Var");
   const rest = fl.rest;
   const lays = sig_def(fl, ck.k).lays;
-  const vs = ck.args.map((a, i): Val | null => {
+  const vs = file_scope(fl, ["rest"], () => ck.args.map((a, i): Val | null => {
     if (xs[i].$ === "Var") {
       return null;
     }
     fl.rest = [...xs.slice(i + 1).filter((x) => x.$ !== "Var"), ...vars,
       ...rest];
     return emit_expr(fl, a, null, lays[i]);
-  });
-  fl.rest = rest;
+  }));
   xs.forEach((x, i) => brw[i] || (vs[i] ??= bind_pop(fl, x)));
   return xs.flatMap((x, i) => {
     const at = ck.k + "~" + i;
@@ -2126,12 +2140,10 @@ function emit_args(fl: File, ck: Call, jump = false, fork = false): string[] {
 // Expressions in order, each seeing the later ones as its rest.
 function emit_each(fl: File, xs: HTerm[], ats: Lay[] | null): Val[] {
   const rest = fl.rest;
-  const vs = xs.map((x, i) => {
+  return file_scope(fl, ["rest"], () => xs.map((x, i) => {
     fl.rest = [...xs.slice(i + 1), ...rest];
     return emit_expr(fl, x, null, ats && ats[i]);
-  });
-  fl.rest = rest;
-  return vs;
+  }));
 }
 
 function emit_put(fl: File, dst: Dst, v: Val): void {
@@ -2151,10 +2163,10 @@ function emit_fuse(fl: File, ck: Call, dst: Dst, tail = false): void {
   if (!flat) {
     const vs = lays.map((lay) =>
       val_new(ws.splice(0, lay.ks.length), lay));
-    const outer = fl.def;
-    fl.def = ck.k;
-    emit_body(fl, tld.h as HTerm, tld.T, ers, vs, dst);
-    fl.def = outer;
+    file_scope(fl, ["def"], () => {
+      fl.def = ck.k;
+      emit_body(fl, tld.h as HTerm, tld.T, ers, vs, dst);
+    });
     return;
   }
   const out = emit_dst(fl, ret);
@@ -2196,22 +2208,23 @@ function emit_native(fl: File, ck: Call, ers: HTerm[]): string {
   const name = seg_ref(fl, `spin_${fl.spun.size}`);
   fl.spun.set(key, name);
   const tld = fl.book.tlds[ck.k] as Def;
-  const outer = { ...fl };
-  const vals = emit_open(fl, ck.k);
-  const seg = fl.seg;
-  seg.fid = name;
-  const dst = val_new(seg.ret.ks.map(() => name_local(fl, "v")), seg.ret);
-  emit_body(fl, tld.h as HTerm, tld.T, ers, vals, dst);
-  fl.spins.push([name, [`${seg.lines.length < SPIN_FAR ? "INLINE" : "FAR"} Term ${name}(Env e, THR Term* o${
-    seg.ks.map((k, i) => `, ${lay_c(k)} r${i}`).join("")}) {`,
-  "  u32 wpoll = 0;",
-  ...dst.ws.map((v, j) => `  ${lay_c(seg.ret.ks[j])} ${v} = 0;`),
-  ...seg_take(seg).map((l) => "  " + l),
-  "  WL_SPIN", ...seg.lines, "  break;", "  }",
-  ...dst.ws.map((v, j) => `  o[${j}] = ${v};`),
-  "  return 1;", "}"].join("\n"), seg.refs]);
-  Object.assign(fl, outer);
-  return name;
+  return file_scope(fl,
+    ["seg", "spares", "tab", "uses", "rest", "fuel", "def"], () => {
+      const vals = emit_open(fl, ck.k);
+      const seg = fl.seg;
+      seg.fid = name;
+      const dst = val_new(seg.ret.ks.map(() => name_local(fl, "v")), seg.ret);
+      emit_body(fl, tld.h as HTerm, tld.T, ers, vals, dst);
+      fl.spins.push([name, [`${seg.lines.length < SPIN_FAR ? "INLINE" : "FAR"} Term ${name}(Env e, THR Term* o${
+        seg.ks.map((k, i) => `, ${lay_c(k)} r${i}`).join("")}) {`,
+      "  u32 wpoll = 0;",
+      ...dst.ws.map((v, j) => `  ${lay_c(seg.ret.ks[j])} ${v} = 0;`),
+      ...seg_take(seg).map((l) => "  " + l),
+      "  WL_SPIN", ...seg.lines, "  break;", "  }",
+      ...dst.ws.map((v, j) => `  o[${j}] = ${v};`),
+      "  return 1;", "}"].join("\n"), seg.refs]);
+      return name;
+    });
 }
 
 function emit_dst(fl: File, lay: Lay, k = "v"): Val {
@@ -2263,11 +2276,10 @@ function emit_clo(fl: File, x: HTerm, ty: HTerm | null): Val {
   const words = live.flatMap(([, b]) => val_own(fl, b.val));
   const name = seg_name(fl, "c");
   const clo = seg_clo(fl, seg_fid(name), words);
-  const outer = { seg: fl.seg, uses: fl.uses, spares: fl.spares,
-    tab: fl.tab, rest: fl.rest };
-  const [arg] = seg_open(fl, name, BOX, null, live, "x", ["w64"], [x]);
-  emit_body(fl, x, ty, [], [val_new([arg], BOX)], null);
-  Object.assign(fl, outer);
+  file_scope(fl, ["seg", "uses", "spares", "tab", "rest"], () => {
+    const [arg] = seg_open(fl, name, BOX, null, live, "x", ["w64"], [x]);
+    emit_body(fl, x, ty, [], [val_new([arg], BOX)], null);
+  });
   return val_new([clo], BOX);
 }
 
@@ -2454,10 +2466,10 @@ function emit_expr(fl: File, tm: HTerm, ty0: HTerm | null,
     case "Let": {
       const o = term_open(x);
       if (let_live(fl, x)[0]) {
-        const rest = fl.rest;
-        fl.rest = [o.b, ...rest];
-        emit_let(fl, x, o);
-        fl.rest = rest;
+        file_scope(fl, ["rest"], () => {
+          fl.rest = [o.b, ...fl.rest];
+          emit_let(fl, x, o);
+        });
       }
       return emit_expr(fl, o.b, null, at);
     }
@@ -2565,29 +2577,30 @@ function emit_fork(fl: File, x: HLet, ers: HTerm[]): void {
   if (fork) {
     spare_flush(fl);
     fl.seg.fork = true;
-    const uses = new Map(fl.uses);
-    block(fl, "if (!seq) {", () => {
-      const margs = calls.map((c, j) => {
-        fl.rest = [...x.v.filter((_, i) => i !== j), o.b];
-        return emit_args(fl, c, false, true);
+    file_scope(fl, ["uses"], () => {
+      fl.uses = new Map(fl.uses);
+      block(fl, "if (!seq) {", () => {
+        const margs = calls.map((c, j) => {
+          fl.rest = [...x.v.filter((_, i) => i !== j), o.b];
+          return emit_args(fl, c, false, true);
+        });
+        const live = [...fl.uses].filter(([p, b]) =>
+          !val_brw(fl, b.val) || rest_use(fl, [o.b], p) > 0);
+        hold = live.map(([p]) => p);
+        const caps = live.flatMap(([, b]) => b.val.ws);
+        spare_flush(fl);
+        const jn = emit_task(fl, seg_fid(name), calls.length, caps);
+        const jt = `term_tsk(${seg_fid(name)}, ${jn})`;
+        let idx = caps.length;
+        calls.forEach((c, j) => {
+          const fj = seg_fid(c.k);
+          file_push(fl, `e.mem[${jn} + ${idx}] = term_tsk(${fj}, ${
+            emit_task(fl, fj, 0, margs[j], jt, idx)});`);
+          idx += sig_def(fl, c.k).ret.ks.length;
+        });
+        file_push(fl, `return ${jt};`);
       });
-      const live = [...fl.uses].filter(([p, b]) =>
-        !val_brw(fl, b.val) || rest_use(fl, [o.b], p) > 0);
-      hold = live.map(([p]) => p);
-      const caps = live.flatMap(([, b]) => b.val.ws);
-      spare_flush(fl);
-      const jn = emit_task(fl, seg_fid(name), calls.length, caps);
-      const jt = `term_tsk(${seg_fid(name)}, ${jn})`;
-      let idx = caps.length;
-      calls.forEach((c, j) => {
-        const fj = seg_fid(c.k);
-        file_push(fl, `e.mem[${jn} + ${idx}] = term_tsk(${fj}, ${
-          emit_task(fl, fj, 0, margs[j], jt, idx)});`);
-        idx += sig_def(fl, c.k).ret.ks.length;
-      });
-      file_push(fl, `return ${jt};`);
     });
-    fl.uses = uses;
   }
   const chain = calls.map(() => o.b);
   for (let j = calls.length - 2; j >= 0; j -= 1) {
@@ -2804,17 +2817,18 @@ function emit_match(fl: File, x: Of<"Mat"> | Of<"Efq">,
   }
   const spares = fl.spares;
   const arms2 = lv.map(([, h, fs]) => () => {
-    fl.spares = spares.slice();
-    const outer = { seg: fl.seg, tab: fl.tab, uses: new Map(fl.uses) };
-    bind_dead(fl, [h]);
-    emit_body(fl, h, null, ers, [...fs(), ...rest], dst);
-    if (dst !== null) {
-      spare_flush(fl);
-    }
-    fl.spares = dst === null ? spares : [];
-    Object.assign(fl, outer);
+    file_scope(fl, ["seg", "tab", "uses", "spares"], () => {
+      fl.uses = new Map(fl.uses);
+      fl.spares = spares.slice();
+      bind_dead(fl, [h]);
+      emit_body(fl, h, null, ers, [...fs(), ...rest], dst);
+      if (dst !== null) {
+        spare_flush(fl);
+      }
+    });
   });
   emit_chain(fl, (i) => lv[i][0], arms2);
+  fl.spares = dst === null ? spares : [];
 }
 
 function emit_stuck(fl: File): void {
@@ -3147,11 +3161,11 @@ function js_expr(fl: File, tm: HTerm,
           (ty_all(fl.book, ty) as HAll).B(DUMMY));
       }
       const arg = name_local(fl, "x");
-      const seg = fl.seg;
-      fl.seg = seg_new("", BOX, []);
-      js_func(fl, x, ty, [arg]);
-      const lines = fl.seg.lines;
-      fl.seg = seg;
+      const lines = file_scope(fl, ["seg"], () => {
+        fl.seg = seg_new("", BOX, []);
+        js_func(fl, x, ty, [arg]);
+        return fl.seg.lines;
+      });
       return `run_clo((${arg}) => {\n${lines.join("\n")}\n})`;
     }
     case "Hol": die("cannot compile a hole");
